@@ -466,7 +466,16 @@ class DataLoader:
         self.stride = world_size * seq_len * batch_size
         shards = sorted(Path(data_path).glob(f"fineweb_{split}_*.bin"))
         assert shards, f"No {split} shards in {data_path}"
-        tokens = np.concatenate([np.fromfile(s, dtype=np.uint16) for s in shards[:10]])
+
+        def _load_shard(path):
+            header = np.fromfile(path, dtype="<i4", count=256)
+            if header[0] != 20240520 or header[1] != 1:
+                # fallback: raw uint16 (no header)
+                return np.fromfile(path, dtype=np.uint16)
+            num_tokens = int(header[2])
+            return np.fromfile(path, dtype="<u2", count=num_tokens, offset=256 * 4)
+
+        tokens = np.concatenate([_load_shard(s) for s in shards[:10]])
         actual_max = int(tokens.max())
         if actual_max >= vocab_size:
             if rank == 0:
@@ -579,7 +588,7 @@ def serialize_state(state: dict) -> bytes:
         buf.write(nb)
         buf.write(struct.pack("I" * (len(q.shape) + 1), len(q.shape), *q.shape))
         buf.write(struct.pack("f", float(scale)))
-        buf.write(q.numpy().tobytes())
+        buf.write(q.cpu().numpy().tobytes())
     return buf.getvalue()
 
 
@@ -637,11 +646,17 @@ def main():
 
     val_shards = sorted(Path(cfg.data_path).glob("fineweb_val_*.bin"))
     assert val_shards
-    val_tokens = torch.from_numpy(
-        np.fromfile(val_shards[0], dtype=np.uint16).astype(np.int64)
-    ).to(device)
-    # Clamp val tokens to guard against mismatched data/tokenizer
-    val_tokens = val_tokens.clamp(0, cfg.vocab_size - 1)
+
+    def _load_shard(path):
+        header = np.fromfile(path, dtype="<i4", count=256)
+        if len(header) == 256 and int(header[0]) == 20240520 and int(header[1]) == 1:
+            num_tokens = int(header[2])
+            return np.fromfile(path, dtype="<u2", count=num_tokens, offset=256 * 4)
+        return np.fromfile(path, dtype=np.uint16)
+
+    val_tokens = torch.from_numpy(_load_shard(val_shards[0]).astype(np.int64)).to(
+        device
+    )
 
     # Model
     model = GPT(cfg).to(device)
